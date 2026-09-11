@@ -1,0 +1,10 @@
+# 로컬 배송업체 SFTP 서버 (PoC용)
+services:
+  courier-sftp:
+    image: atmoz/sftp
+    container_name: courier-sftp
+    ports:
+      - "2222:22"
+    command: courier:courierpass:::upload
+    volumes:
+      - ./docker/sftp-data:/home/courier/upload
