@@ -1,140 +1,143 @@
-# 카드 배송 대외계 배치 인터페이스
+# Card Delivery B2B Batch Interface
 
-> 카드사(내부)에서 배송업체(외부)로 배송요청 파일을 주기적으로 전송하는
-> **File-based B2B Batch Integration** 구조를 재현한 학습용 PoC
+**English** | [한국어](README.ko.md) | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-실시간 API가 아니라 **파일**로 주고받는 대외계 연동에서 반복적으로 등장하는 문제
-— 멱등성, 부분 실패 격리, 쓰다 만 파일, 전송 이력 — 를 직접 겪어보고 해결해보는 것이 목표다.
+> A learning PoC that recreates the **file-based B2B batch integration** a card issuer
+> (internal) uses to push delivery request files to a courier (external) on a schedule
 
-<br>
-
-## 🎯 학습 목표
-
-- 파일 기반 연동에서 **멱등성을 상태 머신(`READY → REQUESTED`)으로** 보장하는 방법을 익힌다
-- 배치 트랜잭션이 롤백돼도 **이력은 남아야 하는 이유**와 `REQUIRES_NEW` 분리를 체감한다
-- `.part` 업로드 후 rename이라는 대외계 관례가 **왜 필요한지** 확인한다
-- 전송/암호화/파일생성을 **포트 인터페이스로 분리**해 SFTP를 S3로 교체 가능한 구조를 만든다
+The point is to run into — and work through — the problems that keep coming up when an
+external integration exchanges **files** rather than live API calls: idempotency,
+isolating partial failures, half-written files, and transfer history.
 
 <br>
 
-## 🚀 기능 요구사항
+## 🎯 Learning Goals
 
-### 배치 실행
-
-- 배치는 **매 분** 실행되며, 애플리케이션 기동 직후에도 **1회** 실행된다.
-- 배치는 활성 상태(`active = true`)인 배송업체를 모두 순회한다.
-
-### 배송요청 파일 전송
-
-- 배송업체별로 상태가 `READY`인 배송요청만 전송 대상으로 조회한다.
-  - 대상이 없으면 아무 파일도 만들지 않고 넘어간다.
-- 전송 대상은 **발급유형(`NEW` / `REN` / `RET`)별로 나누어** 각각 하나의 파일로 만든다.
-- 생성한 파일은 **AES-256-GCM**으로 암호화한 뒤 배송업체 SFTP 서버로 업로드한다.
-- 업로드가 끝나면 해당 배송요청의 상태를 `READY → REQUESTED`로 갱신하고,
-  전송한 파일명과 전송 시각을 함께 기록한다.
-- 배치 1회 실행마다 **배치 이력**(대상 건수, 전송 건수, 성공/실패, 실패 사유)을 남긴다.
-
-### 예외 처리
-
-- 한 배송업체에서 예외가 발생해도 **다른 배송업체의 전송은 계속 진행**한다.
-- 배치 도중 실패하면 상태 갱신을 **롤백**해 `READY`를 유지한다. 다음 배치가 자동으로 재시도한다.
-- 배치가 롤백되더라도 **"실패했다"는 이력은 남아야 한다.**
+- Learn how to guarantee **idempotency with a state machine** (`READY → REQUESTED`) in a file-based integration
+- Feel out **why history has to survive a rollback**, and how `REQUIRES_NEW` separates it
+- See **why** the B2B convention of uploading as `.part` and then renaming exists
+- Split file writing, encryption and transfer into **ports** so SFTP can be swapped for S3
 
 <br>
 
-## 📄 인터페이스 규격
+## 🚀 Functional Requirements
 
-### 레코드 (고정길이 132자)
+### Batch execution
 
-| 구분 | 길이 | 정렬 | 비고 |
+- The batch runs **every minute**, plus **once** right after the application starts.
+- The batch iterates over every active courier (`active = true`).
+
+### Delivery request file transfer
+
+- For each courier, only delivery requests in `READY` are picked up.
+  - With nothing to send, no file is created and the courier is skipped.
+- Targets are **split by issue type (`NEW` / `REN` / `RET`)**, one file per type.
+- Each file is encrypted with **AES-256-GCM** and uploaded to the courier's SFTP server.
+- Once the upload finishes, the delivery request moves from `READY` to `REQUESTED`,
+  recording the file name it went out in and the time it was sent.
+- Every batch run leaves a **job history** entry (targets, sent count, success/failure, failure reason).
+
+### Error handling
+
+- An exception at one courier must **not stop the transfers for the others**.
+- A failure mid-batch **rolls back** the status update so it stays `READY`. The next batch retries it automatically.
+- **Even when the batch rolls back, the "this failed" history entry has to survive.**
+
+<br>
+
+## 📄 Interface Specification
+
+### Record (fixed length, 132 characters)
+
+| Field | Length | Alignment | Notes |
 |---|---|---|---|
-| 발급유형 | 3 | 좌측정렬 | `NEW` / `REN` / `RET` |
-| 카드번호 | 19 | 좌측정렬 | 마스킹된 형태만 보관 |
-| 수령인 | 10 | 좌측정렬 | 공백 패딩 |
-| 주소 | 100 | 좌측정렬 | 공백 패딩 |
+| Issue type | 3 | Left | `NEW` / `REN` / `RET` |
+| Card number | 19 | Left | Only the masked form is kept |
+| Recipient | 10 | Left | Space padded |
+| Address | 100 | Left | Space padded |
 
-### 트레일러
+### Trailer
 
-마지막 줄에는 레코드 구분자 `T`와 건수 9자리(0 패딩)를 붙인다.
+The last line carries the record marker `T` and a 9-digit count (zero padded).
 
 ```
 T000000003
 ```
 
-| 구분 | 길이 | 값 |
+| Field | Length | Value |
 |---|---|---|
-| 레코드 구분자 | 1 | `T` |
-| 건수 | 9 | 우측정렬, 0 패딩 |
+| Record marker | 1 | `T` |
+| Count | 9 | Right aligned, zero padded |
 
-### 파일명
+### File name
 
 ```
 CJX_NEW_20260911093000_CJX.dat.enc
 ```
 
-| 구간 | 예시 | 의미 |
+| Segment | Example | Meaning |
 |---|---|---|
-| 배송업체 코드 | `CJX` | 수신처 |
-| 발급유형 | `NEW` | 파일 종류 |
-| 배치 ID | `20260911093000_CJX` | 배치 실행 시각(`yyyyMMddHHmmss`) + 배송업체 코드 |
-| `.dat` | — | 고정길이 원본 |
-| `.enc` | — | AES-256-GCM 암호화 결과 |
+| Courier code | `CJX` | Recipient |
+| Issue type | `NEW` | File kind |
+| Batch ID | `20260911093000_CJX` | Batch start time (`yyyyMMddHHmmss`) + courier code |
+| `.dat` | — | Fixed-length original |
+| `.enc` | — | AES-256-GCM encrypted result |
 
-파일명 자체가 **멱등성 키** 역할을 한다. 같은 배치 ID로는 같은 파일만 만들어진다.
-
-<br>
-
-## 📐 프로그래밍 요구사항
-
-- Java 17, Spring Boot 3.3.4 를 사용한다.
-- DB는 H2(in-memory, Oracle 모드) + Spring Data JPA 를 사용한다.
-- **`DeliveryExportService`는 SFTP를 전혀 몰라야 한다.**
-  파일 생성 / 암호화 / 전송은 각각 포트 인터페이스로 분리하고, 구현체는 `infrastructure`에 둔다.
-- **배치 주기·출력 경로·암호화 키는 코드에 하드코딩하지 않는다.** `application.yml`로 뺀다.
-- 도메인 객체는 setter를 열지 않고, 의미 있는 메서드(`markRequested()`)로 상태를 바꾼다.
-- **이력 기록은 배치 트랜잭션과 분리한다.** 롤백되더라도 실패 이력은 남아야 한다.
-- **커밋 단위는 아래 기능 목록 단위로 한다.**
+The file name itself acts as the **idempotency key**. One batch ID only ever produces the same file.
 
 <br>
 
-## ✅ 구현할 기능 목록
+## 📐 Programming Requirements
 
-- [x] 배치 실행
-  - [x] `@Scheduled` 기반 주기 실행 (cron 외부 설정)
-  - [x] 애플리케이션 기동 직후 1회 실행
-  - [x] 활성 배송업체 전체 순회
-  - [x] 배송업체 단위 예외 격리 — 한 곳이 실패해도 나머지는 계속 진행
-- [x] 배송요청 파일 생성
-  - [x] `READY` 상태 배송요청만 조회
-  - [x] 발급유형별 그룹핑 후 파일 분리
-  - [x] 고정길이 레코드 생성 (132자)
-  - [x] 건수 트레일러 추가
-  - [ ] 바이트 기준 패딩 (EUC-KR)
-- [x] 암호화
-  - [x] AES-256-GCM 암호화
-  - [x] IV를 파일 선두 12바이트에 부착
-  - [x] GCM 태그로 무결성 검증
-  - [ ] 키를 외부 저장소(KMS/Vault)에서 주입
-- [x] SFTP 전송
-  - [x] JSch(mwiede fork) 기반 업로드
-  - [x] `.part`로 업로드 후 rename — 쓰다 만 파일 수신 방지
-  - [x] 접속 타임아웃 설정 (10초)
-  - [ ] `known_hosts` 기반 호스트키 검증
-- [x] 상태 관리 · 이력
-  - [x] 전송 성공 시 `READY → REQUESTED` 갱신
-  - [x] 전송 파일명 / 전송 시각 기록
-  - [x] 배치 이력 기록 (대상 건수, 전송 건수, 성공·실패, 실패 사유)
-  - [x] 이력은 `REQUIRES_NEW`로 분리 — 배치가 롤백돼도 이력은 남음
-  - [ ] 배송결과 회신 파일 수신 (`REQUESTED → DELIVERED` / `RETURNED`)
-- [x] 단위 테스트 (고정길이 파일 생성 / AES-GCM 암복호화)
+- Use Java 17 and Spring Boot 3.3.4.
+- Use H2 (in-memory, Oracle mode) with Spring Data JPA.
+- **`DeliveryExportService` must know nothing about SFTP.**
+  File writing, encryption and transfer each get a port interface; implementations live in `infrastructure`.
+- **Never hardcode the schedule, output path or encryption key.** They belong in `application.yml`.
+- Domain objects expose no setters; state changes go through meaningful methods (`markRequested()`).
+- **Keep history recording out of the batch transaction.** A failure entry has to survive a rollback.
+- **Commit granularity follows the feature checklist below.**
 
 <br>
 
-## 📤 실행 결과
+## ✅ Feature Checklist
 
-시드 데이터는 배송업체 2곳(`CJX` 3건 / `HNJ` 2건), 발급유형 3종으로 구성되어 있다.
+- [x] Batch execution
+  - [x] Scheduled runs with `@Scheduled` (cron externalized)
+  - [x] One run right after application startup
+  - [x] Iterate over every active courier
+  - [x] Per-courier exception isolation — one failure doesn't stop the rest
+- [x] Delivery request file writing
+  - [x] Query only `READY` delivery requests
+  - [x] Group by issue type and split into separate files
+  - [x] Write fixed-length records (132 characters)
+  - [x] Append the count trailer
+  - [ ] Byte-based padding (EUC-KR)
+- [x] Encryption
+  - [x] AES-256-GCM
+  - [x] Prepend the 12-byte IV to the file
+  - [x] Integrity check via the GCM tag
+  - [ ] Inject the key from an external store (KMS/Vault)
+- [x] SFTP transfer
+  - [x] Upload with JSch (mwiede fork)
+  - [x] Upload as `.part`, then rename — keeps half-written files from being picked up
+  - [x] Connection timeout (10s)
+  - [ ] Host key verification against `known_hosts`
+- [x] State and history
+  - [x] `READY → REQUESTED` on a successful transfer
+  - [x] Record the file name and the time sent
+  - [x] Record job history (targets, sent count, success/failure, failure reason)
+  - [x] History runs in `REQUIRES_NEW` — it survives a batch rollback
+  - [ ] Inbound delivery result files (`REQUESTED → DELIVERED` / `RETURNED`)
+- [x] Unit tests (fixed-length file writing / AES-GCM round trip)
 
-### 첫 배치 — 전송 성공
+<br>
+
+## 📤 Results
+
+The seed data has two couriers (`CJX` with 3 requests, `HNJ` with 2) across three issue types.
+
+### First batch — transfers succeed
 
 ```
 배송 배치 시작 - 대상 배송업체 2곳
@@ -149,9 +152,9 @@ CJX_NEW_20260911093000_CJX.dat.enc
 배송 배치 종료
 ```
 
-### 다음 배치 — 대상 없음 (멱등성)
+### Next batch — nothing to send (idempotency)
 
-대상이 모두 `REQUESTED`로 바뀌었으므로 같은 건을 다시 보내지 않는다.
+Everything moved to `REQUESTED`, so the same requests are never sent twice.
 
 ```
 배송 배치 시작 - 대상 배송업체 2곳
@@ -160,9 +163,9 @@ CJX_NEW_20260911093000_CJX.dat.enc
 배송 배치 종료
 ```
 
-### 전송 실패 — 업체 격리 + 이력
+### A transfer fails — isolation and history
 
-한 업체가 실패해도 다음 업체는 계속 진행되고, 롤백돼도 실패 이력은 남는다.
+One courier failing doesn't stop the next, and the failure entry survives the rollback.
 
 ```
 [CJX] 배치 실패 batchId=20260911093100_CJX
@@ -170,128 +173,130 @@ CJX_NEW_20260911093000_CJX.dat.enc
 [HNJ] NEW 1건 전송 완료 -> HNJ_NEW_20260911093100_HNJ.dat.enc
 ```
 
+> Log messages are in Korean because they come straight from the application code.
+
 <br>
 
-## 🏗 아키텍처
+## 🏗 Architecture
 
 ```mermaid
 flowchart LR
-    SCHED["@Scheduled<br/>DeliveryScheduler"] --> RUNNER["DeliveryJobRunner<br/>업체 순회 · 예외 격리"]
-    RUNNER --> APP["DeliveryExportService<br/>@Service 비즈니스 로직"]
+    SCHED["@Scheduled<br/>DeliveryScheduler"] --> RUNNER["DeliveryJobRunner<br/>iterate couriers · isolate failures"]
+    RUNNER --> APP["DeliveryExportService<br/>@Service business logic"]
     APP --> REPO["DeliveryRequestRepository"] --> DB[(H2)]
-    APP --> WRITER["DeliveryFileWriter<br/>고정길이 파일"]
+    APP --> WRITER["DeliveryFileWriter<br/>fixed-length file"]
     APP --> ENC["FileEncryptor<br/>AES-256-GCM"]
-    APP --> TRANS["FileTransferer<br/>JSch SFTP"] -->|"SFTP"| SFTP["배송업체 SFTP"]
+    APP --> TRANS["FileTransferer<br/>JSch SFTP"] -->|"SFTP"| SFTP["Courier SFTP"]
 ```
 
-포트와 어댑터를 분리한 헥사고날 라이트 구조다.
+A hexagonal-lite layout that separates ports from adapters.
 
 ```
 com.poc.carddelivery
 ├── batch/
-│   ├── scheduler/    # @Scheduled 트리거, 기동 시 1회 실행 러너
-│   └── job/          # DeliveryJobRunner — 배송업체 순회, 업체 단위 예외 격리
+│   ├── scheduler/    # @Scheduled trigger, startup runner
+│   └── job/          # DeliveryJobRunner — iterates couriers, isolates per-courier failures
 ├── domain/
-│   ├── delivery/     # CardIssue, DeliveryRequest(상태 머신), JobHistory
-│   └── courier/      # 배송업체 설정 (SFTP 접속정보)
-├── application/      # DeliveryExportService + 포트 3종
-│   ├── DeliveryFileWriter   (파일 생성 포트)
-│   ├── FileEncryptor        (암호화 포트)
-│   └── FileTransferer       (전송 포트 — SFTP → S3 교체 가능)
+│   ├── delivery/     # CardIssue, DeliveryRequest (state machine), JobHistory
+│   └── courier/      # Courier configuration (SFTP credentials)
+├── application/      # DeliveryExportService + 3 ports
+│   ├── DeliveryFileWriter   (file writing port)
+│   ├── FileEncryptor        (encryption port)
+│   └── FileTransferer       (transfer port — SFTP can become S3)
 └── infrastructure/
-    ├── file/         # 고정길이 파일 생성
+    ├── file/         # fixed-length file writing
     ├── crypto/       # AES-256-GCM
-    ├── sftp/         # JSch(mwiede fork) 업로더
-    └── persistence/  # Spring Data JPA (도메인 패키지의 Repository 인터페이스 사용)
+    ├── sftp/         # JSch (mwiede fork) uploader
+    └── persistence/  # Spring Data JPA (implements the repository interfaces in domain)
 ```
 
-전송 포트가 인터페이스로 분리되어 있어 SFTP를 S3나 다른 전송 수단으로 교체할 수 있다.
+Because the transfer port is an interface, SFTP can be swapped for S3 or any other transport.
 
 <br>
 
-## 🛠 기술 스택
+## 🛠 Tech Stack
 
-| 구분 | 사용 기술 |
+| Area | Technology |
 |---|---|
 | Language | Java 17 |
 | Framework | Spring Boot 3.3.4 |
-| 영속성 | Spring Data JPA, H2 (in-memory, Oracle 모드) |
+| Persistence | Spring Data JPA, H2 (in-memory, Oracle mode) |
 | SFTP | [mwiede/jsch](https://github.com/mwiede/jsch) 0.2.20 |
-| 빌드 | Gradle |
-| 로컬 SFTP 서버 | `atmoz/sftp` (Docker) |
+| Build | Gradle |
+| Local SFTP server | `atmoz/sftp` (Docker) |
 
 <br>
 
-## 🏃 실행 방법
+## 🏃 Getting Started
 
 ```bash
-# 1. 로컬 배송업체 SFTP 서버 기동
+# 1. Start the local courier SFTP server
 docker compose up -d
 
-# 2. Gradle wrapper 생성 (최초 1회)
+# 2. Generate the Gradle wrapper (first time only)
 gradle wrapper --gradle-version 8.10
 
-# 3. 애플리케이션 실행 — 기동 직후 1회 + 매 분 스케줄
+# 3. Run the application — once at startup, then every minute
 ./gradlew bootRun
 
-# 4. 업로드 결과 확인
+# 4. Check what was uploaded
 ls docker/sftp-data/
-# CJX_NEW_20260911093000_CJX.dat.enc 등이 보이면 성공
+# seeing CJX_NEW_20260911093000_CJX.dat.enc and friends means it worked
 ```
 
-| 구분 | 주소 |
+| Item | Address |
 |---|---|
-| H2 콘솔 | `http://localhost:8080/h2-console` (JDBC URL: `jdbc:h2:mem:carddelivery`, 사용자 `sa`, 비밀번호 없음) |
-| 로컬 SFTP | `localhost:2222` (`docker-compose.yml`) |
-| 업로드 결과 | `docker/sftp-data/` |
+| H2 console | `http://localhost:8080/h2-console` (JDBC URL `jdbc:h2:mem:carddelivery`, user `sa`, no password) |
+| Local SFTP | `localhost:2222` (`docker-compose.yml`) |
+| Uploaded files | `docker/sftp-data/` |
 
-H2 콘솔에서 상태와 이력을 확인할 수 있다.
+State and history can be inspected in the H2 console.
 
 ```sql
-SELECT * FROM delivery_request;  -- status = REQUESTED 확인
+SELECT * FROM delivery_request;  -- check status = REQUESTED
 SELECT * FROM job_history;
 ```
 
-### 테스트
+### Tests
 
 ```bash
 ./gradlew test
 ```
 
-- `FixedLengthDeliveryFileWriterTest` — 고정길이 레코드 / 트레일러 규격 검증
-- `AesGcmFileEncryptorTest` — AES-256-GCM 암복호화 및 무결성 검증
+- `FixedLengthDeliveryFileWriterTest` — verifies the fixed-length record and trailer spec
+- `AesGcmFileEncryptorTest` — verifies the AES-256-GCM round trip and integrity check
 
 <br>
 
-## 🤔 설계하며 고민한 점
+## 🤔 Design Decisions
 
-| 주제 | 선택 | 이유 |
+| Topic | Choice | Why |
 |---|---|---|
-| 멱등성 | 상태 기반 조회(`READY`만 대상) + 트랜잭션 롤백 | 중간 실패 시 `READY`가 유지되어 다음 배치가 자동 재시도한다. 이중 전송을 막는다 |
-| 이력 기록 | `REQUIRES_NEW` 별도 트랜잭션 | 배치가 롤백돼도 "실패했다"는 이력은 남아야 한다 |
-| SFTP 업로드 | `.part`로 올린 뒤 rename | 수신측이 쓰다 만 파일을 집어가는 고전적인 대외계 사고를 막는다 |
-| 업체 격리 | 배송업체 단위 try-catch | A업체 장애가 B업체 전송을 막지 않는다 |
-| 암호화 | AES-256-GCM, IV 파일 선두 12바이트 | 기밀성과 무결성(GCM 태그)을 함께 얻는다 |
-| 파일 분리 | 발급유형별 파일 | 수신측이 유형별로 다른 처리를 태우는 실제 규격을 따랐다 |
-| 전송 수단 | `FileTransferer` 포트로 추상화 | SFTP → S3 등으로 교체해도 비즈니스 로직은 그대로다 |
+| Idempotency | State-based query (`READY` only) + transaction rollback | A mid-way failure leaves the row `READY`, so the next batch retries it. Double sends are ruled out |
+| History | Separate `REQUIRES_NEW` transaction | Even when the batch rolls back, the "this failed" entry has to survive |
+| SFTP upload | Upload as `.part`, then rename | Prevents the classic B2B incident of the receiver picking up a half-written file |
+| Courier isolation | try-catch per courier | An outage at courier A must not block transfers to courier B |
+| Encryption | AES-256-GCM, 12-byte IV at the head of the file | Confidentiality and integrity (the GCM tag) in one step |
+| File splitting | One file per issue type | Follows the real-world spec where the receiver routes each type differently |
+| Transport | Abstracted behind the `FileTransferer` port | Switching SFTP for S3 leaves the business logic untouched |
 
 <br>
 
-## ⚠️ 알려진 단순화
+## ⚠️ Known Simplifications
 
-PoC 범위로 의도적으로 남겨둔 부분이다. 실전 적용 전에 반드시 해소해야 한다.
+Deliberately left out to keep the PoC small. Each has to be resolved before any real use.
 
-- **고정길이 패딩이 문자 수 기준** — 실무 규격은 보통 EUC-KR **바이트** 기준이다. 한글이 섞이면 길이가 어긋난다.
-- **AES 키가 `application.yml`에 평문** — 실전은 KMS/Vault + 키 로테이션이 필요하다. 저장소에 있는 키는 테스트용이며 실제 운영에 쓸 수 없다.
-- **`StrictHostKeyChecking=no`** — 호스트키 검증을 생략하고 있다. 실전은 `known_hosts` 등록이 필수다.
-- **SFTP 계정이 시드 데이터에 평문** — 로컬 도커 테스트 전용 계정이다.
-- **전송 성공과 상태 갱신 사이 프로세스 다운 시나리오 미해결** — 파일은 올라갔는데 상태는 `READY`로 남아 재전송될 수 있다. 파일명 기준 원격 존재 확인 또는 수신측 ACK 파일 설계가 다음 과제다.
+- **Fixed-length padding counts characters** — real specs usually count EUC-KR **bytes**. Mixing in Korean text throws the lengths off.
+- **The AES key sits in `application.yml` in plaintext** — real systems need KMS/Vault plus key rotation. The key in this repository is for testing and cannot be used in production.
+- **`StrictHostKeyChecking=no`** — host key verification is skipped. Real systems must register `known_hosts`.
+- **SFTP credentials are plaintext in the seed data** — they belong to the local Docker test container only.
+- **The process-crash window between a successful transfer and the status update is unresolved** — the file can be uploaded while the row stays `READY`, so it gets sent again. Checking the remote for the file name, or designing an ACK file from the receiver, is the next task.
 
 <br>
 
-## 🗺 앞으로 구현할 것
+## 🗺 Roadmap
 
-- [ ] 배송결과 회신 파일 수신 (inbound: `REQUESTED → DELIVERED` / `RETURNED`)
-- [ ] Spring Batch로 리팩토링 후 비교 (JobRepository, chunk, retry)
-- [ ] 바이트 기준 고정길이 패딩 (EUC-KR)
-- [ ] Testcontainers 기반 SFTP 통합 테스트
+- [ ] Inbound delivery result files (`REQUESTED → DELIVERED` / `RETURNED`)
+- [ ] Refactor onto Spring Batch and compare (JobRepository, chunk, retry)
+- [ ] Byte-based fixed-length padding (EUC-KR)
+- [ ] SFTP integration tests with Testcontainers
