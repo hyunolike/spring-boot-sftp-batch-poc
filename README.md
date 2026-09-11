@@ -21,6 +21,7 @@ File-based B2B Batch Integration 구조를 재현한다.
 docker compose up -d
 
 # 2. 애플리케이션 실행 (기동 직후 배치 1회 + 매 분 스케줄)
+# gradle wrapper가 없다면 최초 1회: gradle wrapper --gradle-version 8.10
 ./gradlew bootRun
 
 # 3. 업로드 결과 확인
