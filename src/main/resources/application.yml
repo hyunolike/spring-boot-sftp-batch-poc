@@ -1,0 +1,33 @@
+spring:
+  datasource:
+    url: jdbc:h2:mem:carddelivery;MODE=Oracle
+    username: sa
+    password:
+  jpa:
+    hibernate:
+      ddl-auto: create
+    defer-datasource-initialization: true   # ddl 생성 후 data.sql 실행
+    properties:
+      hibernate:
+        format_sql: true
+  sql:
+    init:
+      mode: always
+  h2:
+    console:
+      enabled: true
+      path: /h2-console
+
+delivery:
+  batch:
+    cron: "0 * * * * *"        # 매 분 (PoC), 실전 예: 0 0 6 * * *
+    run-on-startup: true
+  file:
+    output-dir: ./out
+  crypto:
+    # PoC용 AES-256 키 (Base64, 32바이트). 실전은 KMS/Vault로 대체.
+    key-base64: "q83vESNFZ4mrze8SNFZ4iavN7xEjRWeJq83vESNFZ4k="
+
+logging:
+  level:
+    com.poc.carddelivery: INFO

@@ -1,0 +1,8 @@
+.gradle/
+build/
+out/
+*.enc
+.idea/
+*.iml
+.DS_Store
+docker/sftp-data/
